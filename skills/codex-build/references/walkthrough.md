@@ -16,9 +16,28 @@ $ git checkout -b feat/api-rate-limit
 ```
 
 Orchestrator announces: `MODEL=gpt-5.6-codex EFFORT=high TRACKER=markdown`, shows
-the ordered task list (T1 → T2 → T3), and starts.
+the ordered task list (T1 → T2 → T3), and creates durable state under the
+worktree's private Git directory:
 
-**T1 — claim.** `TASKS.md` gets `- [ ] T1 token-bucket core` marked in-flight.
+```text
+$GIT_DIR/codex-build/runs/20260720T180000Z/
+  run.md
+  tasks.md
+  interfaces.md
+  allowlists/T1.txt
+  allowlists/T2.txt
+  allowlists/T3.txt
+```
+
+`current` points to this run. `T1.txt` contains exactly:
+
+```text
+src/ratelimit/bucket.ts
+src/ratelimit/bucket.test.ts
+```
+
+**T1 — claim.** Durable `tasks.md` gets `- [ ] T1 token-bucket core` marked
+in-flight.
 
 **T1 — brief Codex.** The orchestrator fills the brief skeleton: goal (pure
 token-bucket), interfaces (greenfield — none yet), the verbatim T1 excerpt, files
@@ -30,7 +49,16 @@ $ codex exec "<brief>" -C "$(git rev-parse --show-toplevel)" -s workspace-write 
     -m gpt-5.6-codex -c model_reasoning_effort="high" < /dev/null
 ```
 
-**T1 — review.** Scope check first:
+**T1 — enforce scope, then review.** The executable check runs first:
+
+```
+$ python3 "$SKILL_DIR/scripts/check_scope.py" \
+    --repo "$REPO_ROOT" \
+    --allowlist "$STATE_DIR/allowlists/T1.txt"
+scope check passed: 2 changed paths within the allowlist
+```
+
+The orchestrator then reviews the stat and source:
 
 ```
 $ git diff --stat
@@ -57,6 +85,9 @@ $ npm run build
 
 Green.
 
+The scope checker runs once more after the tests and before staging, catching
+any non-ignored file a test/build tool created outside `T1.txt`.
+
 **T1 — commit.** Stage only T1's files, no attribution:
 
 ```
@@ -68,15 +99,22 @@ refill-over-time, burst, exhaustion, and zero-refill. No Redis/HTTP yet (T2/T3).
 Tests: npm test -- src/middleware (green)."
 ```
 
-**T1 — ledger.** The orchestrator records the interface for the next task's brief:
+**T1 — ledger.** The orchestrator verifies the committed source and appends the
+interface to durable `interfaces.md` for the next task's brief:
 
 ```
+## T1 — a1b2c3d
 class Bucket { constructor(capacity: number, refillRate: number); tryConsume(n=1): boolean }
 // src/ratelimit/bucket.ts
 ```
 
-**T1 — close.** `TASKS.md` → `- [x] T1 (commit a1b2c3d)`. Progress line to user.
-On to T2 — whose brief now pastes the `Bucket` interface above under CONTEXT.
+**T1 — close.** Durable `tasks.md` → `- [x] T1 (commit a1b2c3d; unit + build
+green)`. Progress line to user. On to T2 — whose brief now pastes the `Bucket`
+interface above under CONTEXT.
+
+If context compacts here, the orchestrator reloads `current`, `run.md`,
+`tasks.md`, `interfaces.md`, and the active allowlist before continuing. The
+chat transcript is not the only copy of task state.
 
 ---
 
