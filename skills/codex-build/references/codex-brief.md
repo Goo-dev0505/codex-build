@@ -15,8 +15,9 @@ One or two sentences: what this task must produce, in plain terms.
 
 ## CONTEXT / INTERFACES YOU BUILD ON
 
-The public surface earlier tasks created that this task depends on — paste the
-real signatures, don't describe them:
+The relevant slice of the durable `interfaces.md` ledger — paste the real
+signatures, source paths, and creating commit; don't reconstruct them from chat
+memory or describe them loosely:
 
 ```
 # e.g.
@@ -34,8 +35,9 @@ copy blocks, acceptance criteria. Verbatim, because the wording is the contract.
 
 ## FILES YOU MAY TOUCH
 
-List them explicitly. This is the scope boundary — the orchestrator enforces it
-in review.
+Paste the active task's on-disk allowlist exactly. This is the scope boundary —
+the orchestrator enforces it with `scripts/check_scope.py` before review and
+again before commit.
 
 ```
 src/foo/bar.ts

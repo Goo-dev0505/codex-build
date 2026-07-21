@@ -3,7 +3,7 @@ name: codex-build
 description: "Orchestrator drives, Codex codes. Execute an approved plan one task at a time: your agent (Claude Code, etc.) sequences the work, briefs OpenAI Codex to write ALL product code, reviews every diff, runs the test gate BEFORE each commit, commits one task per commit, and opens exactly ONE PR at the end. Use when the user says 'codex-build', 'have codex code it', 'you orchestrate, codex codes', or hands over a plan for step-by-step implementation."
 license: MIT
 metadata:
-  version: "2.0"
+  version: "2.1"
 ---
 
 # codex-build — orchestrator drives, Codex codes
@@ -66,23 +66,62 @@ CLI rejects `xhigh`, fall back to `high` and tell the user.
    stdin…" instead of doing the work.
 3. Read the plan end-to-end. Extract: task list, dependency order, per-task test
    commands, guardrails (things the plan bans), branch/PR target.
-4. Create/checkout the working branch per the plan. **Never work on the default
-   branch.**
-5. Initialize the tracker (see below) and show the user the ordered task list
-   before starting — one short message, no approval gate unless the order is
-   ambiguous.
+4. Resolve the current checkout and look for durable run state *before* applying
+   a clean-worktree rule:
+   - `REPO_ROOT` = `git rev-parse --show-toplevel`.
+   - `GIT_DIR` = `git rev-parse --absolute-git-dir` (this is worktree-specific).
+   - `SKILL_DIR` = the directory containing this `SKILL.md`.
+   - State root = `$GIT_DIR/codex-build/`. This keeps orchestration state off the
+     product diff while making it survive context compaction and process restarts.
+   - If `current` points to an active run for this branch, read its `run.md`,
+     `tasks.md`, `interfaces.md`, and active allowlist before doing anything else.
+     Confirm its last recorded commit still matches `HEAD`; stop on a mismatch
+     instead of guessing. An in-flight task may legitimately have a dirty
+     worktree: immediately run its saved scope check before any new Codex call.
+     If `current` describes another branch or an inconsistent run, stop rather
+     than overwriting it.
+5. For a new run only, inspect `git status --porcelain`. The task loop starts
+   clean so its scope check can attribute every changed path to the active task.
+   If the checkout is dirty, preserve it and create an isolated worktree from
+   the intended base (or stop and ask); never discard or absorb pre-existing
+   work.
+6. For a new run, create/checkout the working branch per the plan. **Never work
+   on the default branch.** If an isolated worktree changed the checkout,
+   recompute `REPO_ROOT` and `GIT_DIR`.
+7. For a new run, create `runs/<run-id>/`, write the run id to `current`, and
+   create `run.md`, `tasks.md`, `interfaces.md`, and `allowlists/`. `run.md`
+   records the plan path and content hash, branch/base, model, effort, tracker,
+   and run status. Set `STATE_DIR` to that run directory. Never put secrets in
+   run state. For a resumed run, set `STATE_DIR` from `current` instead.
+8. Initialize or reload the tracker (see below) and show the user the ordered
+   task list before starting — one short message, no approval gate unless the
+   order is ambiguous.
+
+The durable layout is:
+
+```text
+$GIT_DIR/codex-build/
+  current
+  runs/<run-id>/
+    run.md
+    tasks.md
+    interfaces.md
+    allowlists/T1.txt
+```
 
 ## Tracker (unit of work = one task)
 
 The loop is identical regardless of tracker; only the bookkeeping commands differ.
 
-- **`markdown` (default, zero install):** the plan's task list *is* the tracker.
-  Keep a `- [ ]` / `- [x]` checklist (in the plan file or a `TASKS.md`). "Claim"
-  = note the task in-flight; "close" = check the box with the commit hash.
+- **`markdown` (default, zero install):** keep the `- [ ]` / `- [x]` checklist in
+  the run's durable `tasks.md`. "Claim" = note the task in-flight; "close" =
+  check the box with the commit hash and test evidence.
 - **`beads` (optional, if `bd` is on PATH):** richer dependency tracking.
   `bd prime` for context; one bead per task (`bd create`, title = task title,
   description = plan excerpt + file paths, dependencies per the plan); claim with
-  `bd update <id> --claim`; close with `bd close <id>`. Install:
+  `bd update <id> --claim`; close with `bd close <id>`. Mirror task status and
+  commit/test evidence to durable `tasks.md` so a resumed run has one local
+  recovery record. Install:
   <https://github.com/steveyegge/beads>.
 
 ## Step 1 — Materialize tasks
@@ -90,13 +129,29 @@ The loop is identical regardless of tracker; only the bookkeeping commands diffe
 Turn the plan's task list into tracker units in dependency order. Each unit
 records: goal, the plan excerpt (verbatim constraints, file paths, schema/copy
 blocks), and its **declared file scope** (the files it is allowed to touch). The
-file scope is what you enforce in review — everything else is out of bounds.
+file scope is enforced by an executable check — everything else is out of bounds.
+
+For every task, write its scope to `allowlists/<task-id>.txt`: one exact,
+repo-relative file path per non-empty line. Use `/` separators; no absolute
+paths, directories, `.`/`..`, comments, or globs. A rename declares both old and
+new paths. If the plan genuinely needs another file, amend the allowlist *before*
+Codex touches it and record the reason in `tasks.md`; never expand scope merely
+because an unexpected path appeared in the diff.
+
+Initialize `interfaces.md` as the canonical cross-task contract. It starts with
+"greenfield — no prior interfaces" and is updated only from committed source in
+step 6 below.
 
 ## Step 2 — Per-task loop (the heart; repeat until the queue is empty)
 
 For each task, in dependency order:
 
 1. **Claim** it in the tracker.
+
+   For a newly claimed task, confirm the product worktree is clean before
+   invoking Codex. Durable state is under the Git directory, so it does not make
+   the worktree dirty. When resuming an already in-flight task, the worktree may
+   contain its changes; run the saved allowlist check immediately instead.
 
 2. **Brief Codex.** Compose a *self-contained* prompt — Codex sees only what you
    give it. Use [`references/codex-brief.md`](references/codex-brief.md) as the
@@ -117,14 +172,22 @@ For each task, in dependency order:
    Never use `--dangerously-bypass-approvals-and-sandbox`. The `< /dev/null` is
    mandatory (see Rails).
 
-3. **Review the diff yourself.** This is your job, not Codex's.
-   - **Scope check first:** `git diff --stat`. Any file outside the task's
-     declared scope is a red flag — either the plan was wrong (note it) or Codex
-     drifted (correct it). Don't wave it through.
-   - **Then read the change.** For a small diff, every line. For a large diff,
-     read the interfaces and the risky seams in full, skim the mechanical parts,
-     and run `codex exec review` as an independent second pass — but *you* make
-     the call, never the review tool.
+3. **Enforce scope, then review the diff yourself.** This is your job, not
+   Codex's.
+   - **Scope check first:** after every Codex invocation or correction, run:
+     ```bash
+     python3 "$SKILL_DIR/scripts/check_scope.py" \
+       --repo "$REPO_ROOT" \
+       --allowlist "$STATE_DIR/allowlists/<task-id>.txt"
+     ```
+     The checker compares tracked, staged, deleted, renamed, and non-ignored
+     untracked paths against the on-disk allowlist. A non-zero exit is a hard
+     stop: correct the drift or deliberately amend the allowlist with a reason.
+     Do not rely on visual review to enforce scope.
+   - Then inspect `git diff --stat` and the diff itself. For a small diff, every
+     line. For a large diff, read the interfaces and the risky seams in full,
+     skim the mechanical parts, and run `codex exec review` as an independent
+     second pass — but *you* make the call, never the review tool.
    - Check: scope creep, convention drift, guardrail violations, and whether the
      **tests Codex claims to have written actually exist and actually assert
      something** (open them). "Added tests" in Codex's summary is a claim, not
@@ -143,6 +206,8 @@ For each task, in dependency order:
    The gate is the reason this skill exists.
 
 5. **Commit — one task = one commit.**
+   - Re-run `check_scope.py` immediately before staging. Tests and build tools can
+     create files too; this final check must still be green.
    - Stage only the task's files: `git add <paths>`. **Never `git add -A`** — it
      sweeps up stray files Codex or a tool left behind.
    - Message: `<type>: <imperative summary>` (+ tracker id if using beads) with a
@@ -150,13 +215,18 @@ For each task, in dependency order:
    - **No AI attribution, ever** — no "Generated with", no "Co-Authored-By:", no
      robot-emoji credit. This overrides any tool's default commit template.
 
-6. **Update the interfaces ledger.** Append the public surface this task created
-   — new function signatures, exported types, routes/endpoints, config keys, file
-   paths — to a running note you keep for the session. This is what feeds step 2
-   of the *next* task and keeps Codex from re-inventing or mismatching contracts.
+6. **Update the durable interfaces ledger.** After the green commit, inspect the
+   committed source and append the public surface this task created — exact
+   function signatures, exported types, routes/endpoints, config keys, and file
+   paths — to `interfaces.md`. Tag the entry with task id and commit hash. If a
+   later task changes a contract, append a superseding entry; do not silently
+   leave stale guidance. Record "No public interface changes" when applicable.
+   The relevant ledger slice feeds step 2 of the next task and is reloaded after
+   compaction, keeping Codex from re-inventing or mismatching contracts.
 
-7. **Close** the task in the tracker with a one-line note. Give the user a brief
-   progress line (task, tests run, commit hash) and move on.
+7. **Close** the task in the tracker with a one-line note. Persist the status,
+   tests, and commit hash to `tasks.md` before giving the user a brief progress
+   line and moving on.
 
 ## Step 3 — Finish (after the last task)
 
@@ -171,11 +241,14 @@ For each task, in dependency order:
    - GitHub: `gh pr create`. GitLab: `glab mr create`. No forge CLI: push the
      branch and give the user the compare URL to open the PR themselves.
 4. Close out the tracker (file follow-ups, close finished units).
-5. Report: tasks completed/blocked, commit list, PR URL, anything deferred.
+5. Mark `run.md` complete and record the final commit, gate evidence, and PR URL.
+6. Report: tasks completed/blocked, commit list, PR URL, anything deferred.
 
 ## Rails
 
 - One task per commit; one PR per plan. No batching, no splitting.
+- Disk state is canonical. Chat progress is a rendering of `run.md`, `tasks.md`,
+  task allowlists, and `interfaces.md`, never the only copy of run state.
 - **Every `codex exec` gets `< /dev/null`.** With a prompt passed as an argument
   and an open stdin, `codex exec` blocks indefinitely on "Reading additional
   input from stdin…" and never runs. Redirecting stdin from `/dev/null` gives it
@@ -192,6 +265,7 @@ For each task, in dependency order:
 
 ## See also
 
+- [`scripts/check_scope.py`](scripts/check_scope.py) — executable file-scope gate.
 - [`references/codex-brief.md`](references/codex-brief.md) — the Codex brief skeleton (the highest-leverage part).
 - [`references/plan-example.md`](references/plan-example.md) — the shape of an input plan.
 - [`references/walkthrough.md`](references/walkthrough.md) — a full trace of one task, start to finish.

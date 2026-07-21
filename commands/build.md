@@ -28,5 +28,8 @@ Full argument string: `$ARGUMENTS`
 4. **Every `codex exec` gets `< /dev/null`** → otherwise a non-interactive run hangs on "Reading additional input from stdin…". This is a hard rail in the skill.
 5. **Test gate before every commit** → never commit red, never skip the gate. This is the point of the skill.
 6. **One task per commit, exactly one PR** → no batching, no splitting; no AI attribution anywhere.
+7. **Persist and enforce run state** → write task allowlists and the interfaces
+   ledger under the worktree's private Git directory, reload them on resume, and
+   run the bundled scope checker after Codex and before every commit.
 
 Report progress per task (task, tests run, commit hash) and finish with the PR URL and anything deferred.

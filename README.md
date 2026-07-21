@@ -21,23 +21,24 @@ So I split the job. The model with my context and taste never gets to skip the r
 ## What it does
 
 ```
-preflight → materialize tasks → for each task:
-    claim → brief Codex → review diff (scope + read + verify tests)
+preflight → persist run state → materialize tasks → for each task:
+    claim → brief Codex → enforce allowlist → review diff + verify tests
           → test gate (BEFORE commit) → commit (no AI attribution)
-          → update interfaces ledger → close
+          → persist interfaces ledger → close
 finish → full-suite gate → push → ONE PR
 ```
 
 - **Tests run before every commit.** Not "usually." Every one. Red gate → no commit.
 - **One task, one commit; one plan, one PR.** Reviewable history, no mega-diffs.
-- **Scope is enforced.** Each task declares the files it may touch; anything outside is flagged in review (`git diff --stat` vs the allowlist).
+- **Scope is executable.** Each task gets an on-disk file allowlist. A bundled script fails on tracked, staged, deleted, renamed, or non-ignored untracked paths outside it—after Codex runs and again before commit.
+- **Runs survive compaction.** Task status, allowlists, test/commit evidence, and interfaces live under the worktree's private Git directory and are reloaded on resume.
 - **No silent takeover.** If Codex can't land a task in three tries, the run *stops* and hands you the diff — it never quietly rewrites the code itself and pretends it passed.
 - **Reproducible.** Model and reasoning effort are pinned per invocation, not inherited from whatever your Codex config happens to be today.
 
 Two ideas do most of the work:
 
 - **The Codex brief** ([`references/codex-brief.md`](skills/codex-build/references/codex-brief.md)). `codex exec` is stateless and sees only the prompt, so the brief carries the goal, the verbatim plan excerpt, the allowed files, and the conventions to match. Brief quality is the main driver of output quality.
-- **The interfaces ledger.** After each task the orchestrator records the public surface it created (signatures, types, endpoints, paths) and feeds the relevant slice into the next task's brief — so Codex builds on real contracts instead of guessing across stateless calls.
+- **The interfaces ledger.** After each green commit the orchestrator writes the verified public surface (signatures, types, endpoints, paths, source commit) to a durable file and feeds the relevant slice into the next task's brief—so Codex builds on real contracts instead of guessing across stateless calls.
 
 ---
 
@@ -48,6 +49,7 @@ Two ideas do most of the work:
 | A Skills-capable agent | yes | runs the skill (built for [Claude Code](https://docs.claude.com/en/docs/claude-code)) |
 | [`codex`](https://github.com/openai/codex) CLI, authed | yes | the coder (`codex login`) |
 | `git` | yes | commits, branch, diff |
+| Python 3 | yes | runs the bundled exact-path scope gate |
 | [`gh`](https://cli.github.com/) or [`glab`](https://gitlab.com/gitlab-org/cli) | optional | opens the PR/MR (falls back to a compare URL) |
 | [`bd`](https://github.com/steveyegge/beads) (beads) | optional | richer task tracking; defaults to a Markdown checklist |
 
@@ -125,6 +127,8 @@ codex-build/
 │   └── build.md                     — /codex-build:build slash command
 └── skills/codex-build/
     ├── SKILL.md                     — the loop: roles, config, per-task steps, rails
+    ├── scripts/check_scope.py       — exact-path allowlist enforcement
+    ├── tests/test_check_scope.py
     └── references/
         ├── codex-brief.md           — the Codex brief skeleton (highest-leverage part)
         ├── plan-example.md          — the shape of an input plan
